@@ -7,818 +7,616 @@ Original file is located at
     https://colab.research.google.com/drive/1b6xhS3RVsURe4lJhu3frDqy39kiJdg5X
 """
 
-!pip install -q streamlit yfinance numpy pandas scipy plotly
-!wget -q -nc https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-!chmod +x cloudflared-linux-amd64
+import streamlit as st
+import yfinance as yf
+import numpy as np
+import pandas as pd
+from scipy import stats
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime, timedelta
+import io
+import json
+import urllib.request
 
-# Commented out IPython magic to ensure Python compatibility.
-# %%writefile app.py
-# import streamlit as st
-# import yfinance as yf
-# import numpy as np
-# import pandas as pd
-# from scipy import stats
-# import plotly.graph_objects as go
-# import plotly.express as px
-# from datetime import datetime, timedelta
-# import json
-# import io
-# 
-# # ==============================================================================
-# # CONFIGURACIÓN DE PÁGINA
-# # ==============================================================================
-# st.set_page_config(
-#     page_title="Institutional Portfolio Monte Carlo Engine",
-#     page_icon="📈",
-#     layout="wide",
-#     initial_sidebar_state="expanded"
-# )
-# 
-# # ==============================================================================
-# # 1. EXTRACCIÓN, CONVERSIÓN DE DIVISA Y LIMPIEZA DE DATOS REALES (YAHOO FINANCE)
-# # ==============================================================================
-# @st.cache_data(ttl=3600, show_spinner=False)
-# def fetch_market_data(tickers: list, years_history: int = 5, base_currency: str = "USD") -> tuple[pd.DataFrame, dict]:
-#     end_date = datetime.today()
-#     start_date = end_date - timedelta(days=int(years_history * 365.25))
-# 
-#     # Descargar tickers
-#     raw = yf.download(tickers, start=start_date, end=end_date, auto_adjust=True, progress=False)
-#     if isinstance(raw.columns, pd.MultiIndex):
-#         prices = raw["Close"]
-#     else:
-#         prices = raw[["Close"]] if "Close" in raw.columns else raw
-#         prices.columns = tickers
-# 
-#     prices = prices.dropna(axis=1, how="all").ffill().dropna()
-#     valid_tickers = list(prices.columns)
-# 
-#     # Conversión de divisa si aplica
-#     converted_prices = prices.copy()
-#     currency_map = {}
-# 
-#     for ticker in valid_tickers:
-#         try:
-#             info = yf.Ticker(ticker).fast_info
-#             currency = info.get("currency", "USD").upper()
-#         except:
-#             currency = "USD"
-# 
-#         currency_map[ticker] = currency
-# 
-#         if currency != base_currency:
-#             pair = f"{currency}{base_currency}=X"
-#             try:
-#                 fx_data = yf.download(pair, start=start_date, end=end_date, auto_adjust=True, progress=False)
-#                 if isinstance(fx_data.columns, pd.MultiIndex):
-#                     fx_rates = fx_data["Close"]
-#                 else:
-#                     fx_rates = fx_data[["Close"]] if "Close" in fx_data.columns else fx_data
-# 
-#                 fx_rates = fx_rates.ffill().reindex(prices.index, method="ffill")
-#                 # Multiplicar los precios del activo por el tipo de cambio
-#                 converted_prices[ticker] = prices[ticker] * fx_rates.iloc[:, 0]
-#             except Exception as e:
-#                 pass # Mantener precio original si falla la conversión
-# 
-#     return converted_prices, currency_map
-# 
-# # ==============================================================================
-# # 2. MOTOR DE SIMULACIÓN MULTI-ACTIVO (CHOLESKY + COLAS PESADAS + BOOTSTRAP + DCA)
-# # ==============================================================================
-# class PortfolioMonteCarloSimulator:
-#     def __init__(
-#         self,
-#         prices: pd.DataFrame,
-#         weights: np.ndarray,
-#         initial_capital: float = 100_000.0,
-#         horizon_years: float = 1.0,
-#         n_sims: int = 10_000,
-#         model_type: str = "Multivariate Student-t (Fat Tails)",
-#         df_student: int = 5,
-#         dca_active: bool = False,
-#         dca_amount: float = 1000.0,
-#         dca_freq: str = "Monthly",
-#         inflation_growth: float = 0.02,
-#         seed: int = 42
-#     ):
-#         self.prices = prices
-#         self.weights = weights / np.sum(weights)
-#         self.initial_capital = initial_capital
-#         self.horizon_years = horizon_years
-#         self.horizon_days = int(horizon_years * 252)
-#         self.n_sims = n_sims
-#         self.model_type = model_type
-#         self.df_student = df_student
-#         self.dca_active = dca_active
-#         self.dca_amount = dca_amount
-#         self.dca_freq = dca_freq
-#         self.inflation_growth = inflation_growth
-#         self.rng = np.random.default_rng(seed)
-# 
-#         self.log_returns = np.log(prices / prices.shift(1)).dropna()
-#         self.simple_returns = prices.pct_change().dropna()
-#         self.n_assets = len(self.weights)
-# 
-#     def run(self) -> tuple[np.ndarray, np.ndarray]:
-#         mu = self.log_returns.mean().values
-#         cov = self.log_returns.cov().values
-# 
-#         if self.model_type == "Historical Block Bootstrap":
-#             hist_vals = self.simple_returns.values
-#             n_hist = len(hist_vals)
-#             idx = self.rng.integers(0, n_hist, size=(self.n_sims, self.horizon_days))
-#             sampled_asset_returns = hist_vals[idx]
-#             port_returns = np.tensordot(sampled_asset_returns, self.weights, axes=([2], [0]))
-#         else:
-#             L = np.linalg.cholesky(cov + np.eye(self.n_assets) * 1e-10)
-#             Z = self.rng.standard_normal((self.n_sims, self.horizon_days, self.n_assets))
-# 
-#             if self.model_type == "Multivariate Student-t (Fat Tails)":
-#                 chi2 = self.rng.chisquare(self.df_student, size=(self.n_sims, self.horizon_days, 1))
-#                 scale_factor = np.sqrt((self.df_student - 2) / chi2)
-#                 Z = Z * scale_factor
-# 
-#             correlated_shocks = Z @ L.T
-#             daily_log_ret = mu + correlated_shocks
-#             asset_simple_ret = np.exp(daily_log_ret) - 1.0
-#             port_returns = np.tensordot(asset_simple_ret, self.weights, axes=([2], [0]))
-# 
-#         # Configuración de pasos temporales para DCA
-#         equity_curves = np.empty((self.n_sims, self.horizon_days + 1))
-#         invested_capital = np.zeros(self.horizon_days + 1)
-# 
-#         equity_curves[:, 0] = self.initial_capital
-#         invested_capital[0] = self.initial_capital
-# 
-#         # Frecuencia de DCA
-#         step_interval = 252
-#         if self.dca_freq == "Weekly":
-#             step_interval = 5
-#         elif self.dca_freq == "Monthly":
-#             step_interval = 21
-#         elif self.dca_freq == "Quarterly":
-#             step_interval = 63
-# 
-#         current_dca = self.dca_amount
-#         for t in range(1, self.horizon_days + 1):
-#             # Calcular el rendimiento de mercado para el día
-#             equity_curves[:, t] = equity_curves[:, t - 1] * (1.0 + port_returns[:, t - 1])
-#             invested_capital[t] = invested_capital[t - 1]
-# 
-#             # Aplicar DCA si está activo en el intervalo correspondiente
-#             if self.dca_active and (t % step_interval == 0):
-#                 # Ajuste por inflación anual
-#                 if t % 252 == 0:
-#                     current_dca *= (1.0 + self.inflation_growth)
-#                 equity_curves[:, t] += current_dca
-#                 invested_capital[t] += current_dca
-# 
-#         return equity_curves, invested_capital
-# 
-# # ==============================================================================
-# # 3. MOTOR DE MÉTRICAS CUANTITATIVAS INSTITUCIONALES
-# # ==============================================================================
-# class InstitutionalMetricsEngine:
-#     def __init__(
-#         self,
-#         paths: np.ndarray,
-#         invested_path: np.ndarray,
-#         periods_per_year: int = 252,
-#         risk_free_rate: float = 0.04,
-#         target_return: float = 0.0,
-#         ruin_threshold: float = 0.25
-#     ):
-#         self.paths = paths
-#         self.invested_path = invested_path
-#         self.n_sims, self.n_steps = paths.shape
-#         self.periods_per_year = periods_per_year
-#         self.rf_annual = risk_free_rate
-#         self.rf_period = (1 + risk_free_rate) ** (1 / periods_per_year) - 1
-#         self.ruin_threshold = ruin_threshold
-# 
-#         self.returns = np.diff(paths, axis=1) / (paths[:, :-1] + 1e-12)
-#         self.initial_capital = paths[:, 0]
-#         self.terminal_capital = paths[:, -1]
-#         self.total_returns = (self.terminal_capital / (invested_path[-1] + 1e-12)) - 1.0
-# 
-#     def _compute_drawdowns(self) -> np.ndarray:
-#         running_max = np.maximum.accumulate(self.paths, axis=1)
-#         return (self.paths - running_max) / (running_max + 1e-12)
-# 
-#     def _compute_max_dd_duration(self, drawdowns: np.ndarray) -> np.ndarray:
-#         is_underwater = drawdowns < 0
-#         durations = np.zeros(self.n_sims, dtype=int)
-#         for i in range(self.n_sims):
-#             padded = np.concatenate(([False], is_underwater[i], [False]))
-#             starts = np.where(padded[1:] & ~padded[:-1])[0]
-#             ends = np.where(~padded[1:] & padded[:-1])[0]
-#             if len(starts) > 0:
-#                 durations[i] = np.max(ends - starts)
-#         return durations
-# 
-#     def compute_all(self) -> dict:
-#         n_years = self.returns.shape[1] / self.periods_per_year
-#         cagr_per_sim = (self.terminal_capital / (self.initial_capital + 1e-12)) ** (1 / n_years) - 1
-#         ann_vol_per_sim = np.std(self.returns, axis=1, ddof=1) * np.sqrt(self.periods_per_year)
-# 
-#         var_95_pct = np.percentile(self.total_returns, 5)
-#         var_99_pct = np.percentile(self.total_returns, 1)
-#         cvar_95_pct = np.mean(self.total_returns[self.total_returns <= var_95_pct])
-#         cvar_99_pct = np.mean(self.total_returns[self.total_returns <= var_99_pct])
-# 
-#         s0 = self.initial_capital[0]
-#         var_95_val = s0 * var_95_pct
-#         cvar_95_val = s0 * cvar_95_pct
-# 
-#         drawdowns = self._compute_drawdowns()
-#         max_dd_per_sim = np.min(drawdowns, axis=1)
-#         ulcer_indices = np.sqrt(np.mean(drawdowns ** 2, axis=1))
-#         dd_durations = self._compute_max_dd_duration(drawdowns)
-# 
-#         prob_profit = np.mean(self.terminal_capital > self.invested_path[-1])
-#         prob_beat_rf = np.mean(cagr_per_sim > self.rf_annual)
-#         prob_ruin = np.mean(np.min(self.paths, axis=1) <= s0 * (1.0 - self.ruin_threshold))
-# 
-#         excess_returns = self.returns - self.rf_period
-#         sharpe_per_sim = (np.mean(excess_returns, axis=1) / (np.std(self.returns, axis=1, ddof=1) + 1e-12)) * np.sqrt(self.periods_per_year)
-# 
-#         # Diagnostic stats
-#         skew = stats.skew(self.total_returns)
-#         kurt = stats.kurtosis(self.total_returns)
-#         mcse = np.std(self.total_returns, ddof=1) / np.sqrt(self.n_sims)
-# 
-#         return {
-#             "kpis": {
-#                 "median_terminal": np.median(self.terminal_capital),
-#                 "expected_cagr": np.mean(cagr_per_sim),
-#                 "var_95_pct": var_95_pct,
-#                 "var_95_val": var_95_val,
-#                 "cvar_95_pct": cvar_95_pct,
-#                 "cvar_95_val": cvar_95_val,
-#                 "expected_max_dd": np.mean(max_dd_per_sim),
-#
+# ==============================================================================
+# CONFIGURACIÓN DE PÁGINA
+# ==============================================================================
+st.set_page_config(
+    page_title="Institutional Portfolio Monte Carlo Engine",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# Commented out IPython magic to ensure Python compatibility.
-# %%writefile app.py
-# import streamlit as st
-# import yfinance as yf
-# import numpy as np
-# import pandas as pd
-# from scipy import stats
-# import plotly.graph_objects as go
-# import plotly.express as px
-# from datetime import datetime, timedelta
-# import io
-# 
-# # ==============================================================================
-# # CONFIGURACIÓN DE PÁGINA
-# # ==============================================================================
-# st.set_page_config(
-#     page_title="Institutional Portfolio Monte Carlo Engine",
-#     page_icon="📈",
-#     layout="wide",
-#     initial_sidebar_state="expanded"
-# )
-# 
-# # ==============================================================================
-# # 1. EXTRACCIÓN, CONVERSIÓN DE DIVISA Y LIMPIEZA DE DATOS REALES (YAHOO FINANCE)
-# # ==============================================================================
-# @st.cache_data(ttl=3600, show_spinner=False)
-# def fetch_market_data(tickers: list, years_history: int = 5, base_currency: str = "USD") -> tuple[pd.DataFrame, dict]:
-#     end_date = datetime.today()
-#     start_date = end_date - timedelta(days=int(years_history * 365.25))
-#     raw = yf.download(tickers, start=start_date, end=end_date, auto_adjust=True, progress=False)
-# 
-#     if isinstance(raw.columns, pd.MultiIndex):
-#         prices = raw["Close"]
-#     else:
-#         prices = raw[["Close"]] if "Close" in raw.columns else raw
-#         prices.columns = tickers
-# 
-#     prices = prices.dropna(axis=1, how="all").ffill().dropna()
-#     valid_tickers = list(prices.columns)
-#     converted_prices = prices.copy()
-#     currency_map = {}
-# 
-#     for ticker in valid_tickers:
-#         try:
-#             info = yf.Ticker(ticker).fast_info
-#             currency = info.get("currency", "USD").upper()
-#         except:
-#             currency = "USD"
-#         currency_map[ticker] = currency
-# 
-#         if currency != base_currency:
-#             pair = f"{currency}{base_currency}=X"
-#             try:
-#                 fx_data = yf.download(pair, start=start_date, end=end_date, auto_adjust=True, progress=False)
-#                 fx_rates = fx_data["Close"] if isinstance(fx_data.columns, pd.MultiIndex) else fx_data[["Close"]]
-#                 fx_rates = fx_rates.ffill().reindex(prices.index, method="ffill")
-#                 converted_prices[ticker] = prices[ticker] * fx_rates.iloc[:, 0]
-#             except:
-#                 pass
-# 
-#     return converted_prices, currency_map
-# 
-# 
-# # ==============================================================================
-# # 2. MOTOR DE SIMULACIÓN MULTI-ACTIVO (CHOLESKY + COLAS PESADAS + BOOTSTRAP + DCA)
-# # ==============================================================================
-# class PortfolioMonteCarloSimulator:
-#     def __init__(
-#         self,
-#         prices: pd.DataFrame,
-#         weights: np.ndarray,
-#         initial_capital: float = 100_000.0,
-#         horizon_years: float = 1.0,
-#         n_sims: int = 10_000,
-#         model_type: str = "Multivariate Student-t (Fat Tails)",
-#         df_student: int = 5,
-#         dca_active: bool = False,
-#         dca_amount: float = 1000.0,
-#         dca_freq: str = "Monthly",
-#         inflation_growth: float = 0.02,
-#         seed: int = 42
-#     ):
-#         self.prices = prices
-#         self.weights = weights / np.sum(weights)
-#         self.initial_capital = initial_capital
-#         self.horizon_years = horizon_years
-#         self.horizon_days = int(horizon_years * 252)
-#         self.n_sims = n_sims
-#         self.model_type = model_type
-#         self.df_student = df_student
-#         self.dca_active = dca_active
-#         self.dca_amount = dca_amount
-#         self.dca_freq = dca_freq
-#         self.inflation_growth = inflation_growth
-#         self.rng = np.random.default_rng(seed)
-# 
-#         self.log_returns = np.log(prices / prices.shift(1)).dropna()
-#         self.simple_returns = prices.pct_change().dropna()
-#         self.n_assets = len(self.weights)
-# 
-#     def run(self) -> tuple[np.ndarray, np.ndarray]:
-#         mu = self.log_returns.mean().values
-#         cov = self.log_returns.cov().values
-# 
-#         if self.model_type == "Historical Block Bootstrap":
-#             hist_vals = self.simple_returns.values
-#             n_hist = len(hist_vals)
-#             idx = self.rng.integers(0, n_hist, size=(self.n_sims, self.horizon_days))
-#             sampled_asset_returns = hist_vals[idx]
-#             port_returns = np.tensordot(sampled_asset_returns, self.weights, axes=([2], [0]))
-#         else:
-#             L = np.linalg.cholesky(cov + np.eye(self.n_assets) * 1e-10)
-#             Z = self.rng.standard_normal((self.n_sims, self.horizon_days, self.n_assets))
-# 
-#             if self.model_type == "Multivariate Student-t (Fat Tails)":
-#                 chi2 = self.rng.chisquare(self.df_student, size=(self.n_sims, self.horizon_days, 1))
-#                 scale_factor = np.sqrt((self.df_student - 2) / chi2)
-#                 Z = Z * scale_factor
-# 
-#             correlated_shocks = Z @ L.T
-#             daily_log_ret = mu + correlated_shocks
-#             asset_simple_ret = np.exp(daily_log_ret) - 1.0
-#             port_returns = np.tensordot(asset_simple_ret, self.weights, axes=([2], [0]))
-# 
-#         equity_curves = np.empty((self.n_sims, self.horizon_days + 1))
-#         invested_capital = np.zeros(self.horizon_days + 1)
-# 
-#         equity_curves[:, 0] = self.initial_capital
-#         invested_capital[0] = self.initial_capital
-# 
-#         step_interval = 21
-#         if self.dca_freq == "Weekly":
-#             step_interval = 5
-#         elif self.dca_freq == "Quarterly":
-#             step_interval = 63
-# 
-#         current_dca = self.dca_amount
-#         for t in range(1, self.horizon_days + 1):
-#             equity_curves[:, t] = equity_curves[:, t - 1] * (1.0 + port_returns[:, t - 1])
-#             invested_capital[t] = invested_capital[t - 1]
-# 
-#             if self.dca_active and (t % step_interval == 0):
-#                 if t % 252 == 0:
-#                     current_dca *= (1.0 + self.inflation_growth)
-#                 equity_curves[:, t] += current_dca
-#                 invested_capital[t] += current_dca
-# 
-#         return equity_curves, invested_capital
-# 
-# 
-# # ==============================================================================
-# # 3. MOTOR DE MÉTRICAS CUANTITATIVAS INSTITUCIONALES
-# # ==============================================================================
-# class InstitutionalMetricsEngine:
-#     def __init__(
-#         self,
-#         paths: np.ndarray,
-#         invested_path: np.ndarray,
-#         periods_per_year: int = 252,
-#         risk_free_rate: float = 0.04,
-#         ruin_threshold: float = 0.25
-#     ):
-#         self.paths = paths
-#         self.invested_path = invested_path
-#         self.n_sims, self.n_steps = paths.shape
-#         self.periods_per_year = periods_per_year
-#         self.rf_annual = risk_free_rate
-#         self.rf_period = (1 + risk_free_rate) ** (1 / periods_per_year) - 1
-#         self.ruin_threshold = ruin_threshold
-# 
-#         self.returns = np.diff(paths, axis=1) / (paths[:, :-1] + 1e-12)
-#         self.initial_capital = paths[:, 0]
-#         self.terminal_capital = paths[:, -1]
-#         self.total_returns = (self.terminal_capital / (invested_path[-1] + 1e-12)) - 1.0
-# 
-#     def _compute_drawdowns(self) -> np.ndarray:
-#         running_max = np.maximum.accumulate(self.paths, axis=1)
-#         return (self.paths - running_max) / (running_max + 1e-12)
-# 
-#     def _compute_max_dd_duration(self, drawdowns: np.ndarray) -> np.ndarray:
-#         is_underwater = drawdowns < 0
-#         durations = np.zeros(self.n_sims, dtype=int)
-#         for i in range(self.n_sims):
-#             padded = np.concatenate(([False], is_underwater[i], [False]))
-#             starts = np.where(padded[1:] & ~padded[:-1])[0]
-#             ends = np.where(~padded[1:] & padded[:-1])[0]
-#             if len(starts) > 0:
-#                 durations[i] = np.max(ends - starts)
-#         return durations
-# 
-#     def compute_all(self) -> dict:
-#         n_years = self.returns.shape[1] / self.periods_per_year
-#         cagr_per_sim = (self.terminal_capital / (self.initial_capital + 1e-12)) ** (1 / n_years) - 1
-#         ann_vol_per_sim = np.std(self.returns, axis=1, ddof=1) * np.sqrt(self.periods_per_year)
-# 
-#         var_95_pct = np.percentile(self.total_returns, 5)
-#         var_99_pct = np.percentile(self.total_returns, 1)
-#         cvar_95_pct = np.mean(self.total_returns[self.total_returns <= var_95_pct])
-#         cvar_99_pct = np.mean(self.total_returns[self.total_returns <= var_99_pct])
-# 
-#         s0 = self.initial_capital[0]
-#         var_95_val = s0 * var_95_pct
-#         cvar_95_val = s0 * cvar_95_pct
-# 
-#         drawdowns = self._compute_drawdowns()
-#         max_dd_per_sim = np.min(drawdowns, axis=1)
-#         ulcer_indices = np.sqrt(np.mean(drawdowns ** 2, axis=1))
-#         dd_durations = self._compute_max_dd_duration(drawdowns)
-# 
-#         prob_profit = np.mean(self.terminal_capital > self.invested_path[-1])
-#         prob_beat_rf = np.mean(cagr_per_sim > self.rf_annual)
-#         prob_ruin = np.mean(np.min(self.paths, axis=1) <= s0 * (1.0 - self.ruin_threshold))
-# 
-#         excess_returns = self.returns - self.rf_period
-#         sharpe_per_sim = (np.mean(excess_returns, axis=1) / (np.std(self.returns, axis=1, ddof=1) + 1e-12)) * np.sqrt(self.periods_per_year)
-# 
-#         skew = stats.skew(self.total_returns)
-#         kurt = stats.kurtosis(self.total_returns)
-#         mcse = np.std(self.total_returns, ddof=1) / np.sqrt(self.n_sims)
-# 
-#         return {
-#             "kpis": {
-#                 "median_terminal": np.median(self.terminal_capital),
-#                 "expected_cagr": np.mean(cagr_per_sim),
-#                 "var_95_pct": var_95_pct,
-#                 "var_95_val": var_95_val,
-#                 "cvar_95_pct": cvar_95_pct,
-#                 "cvar_95_val": cvar_95_val,
-#                 "expected_max_dd": np.mean(max_dd_per_sim),
-#                 "prob_profit": prob_profit,
-#                 "prob_ruin": prob_ruin,
-#                 "median_sharpe": np.median(sharpe_per_sim),
-#                 "skew": skew,
-#                 "kurt": kurt,
-#                 "mcse": mcse
-#             },
-#             "metrics_raw": {
-#                 "cagr_per_sim": cagr_per_sim,
-#                 "ann_vol_per_sim": ann_vol_per_sim,
-#                 "max_dd_per_sim": max_dd_per_sim,
-#                 "ulcer_indices": ulcer_indices,
-#                 "dd_durations": dd_durations,
-#                 "sharpe_per_sim": sharpe_per_sim
-#             }
-#         }
-# 
-# # ==============================================================================
-# # 4. INTERFAZ DE USUARIO STREAMLIT
-# # ==============================================================================
-# st.title("📈 Institutional Portfolio Monte Carlo Engine (Goldman Sachs Edition)")
-# st.caption("Plataforma de análisis de riesgos cuantitativos con datos en tiempo real, calibración histórica, optimización stochástica y reportes de IA.")
-# 
-# # Sidebar para inputs de control
-# with st.sidebar:
-#     st.header("1. Selección de Divisa & Cartera")
-#     base_currency = st.selectbox("Divisa Base de Reporte", ["USD", "EUR", "GBP", "CHF", "JPY"])
-#     currency_symbols = {"USD": "$", "EUR": "€", "GBP": "£", "CHF": "CHF", "JPY": "¥"}
-#     symbol = currency_symbols[base_currency]
-# 
-#     tickers_input = st.text_input("Tickers (Yahoo Finance)", "SPY, QQQ, GLD, TLT, BTC-USD")
-#     weights_input = st.text_input("Pesos (Separados por coma)", "0.35, 0.25, 0.15, 0.15, 0.10")
-#     years_hist = st.slider("Años de Calibración Histórica", 1, 15, 5)
-# 
-#     st.header("2. Estrategia DCA (Aportes Periódicos)")
-#     dca_active = st.checkbox("Activar Aportaciones Periódicas (DCA)", value=True)
-#     initial_capital = st.number_input("Capital Inicial", value=50000, step=5000)
-#     dca_amount = st.number_input("Aporte Fijo de DCA", value=1000, step=100)
-#     dca_freq = st.selectbox("Frecuencia DCA", ["Weekly", "Monthly", "Quarterly"])
-#     inflation_growth = st.slider("Crecimiento DCA por Inflación (%)", 0.0, 10.0, 2.0) / 100
-# 
-#     st.header("3. Configuración del Motor")
-#     model_type = st.selectbox(
-#         "Motor de Simulación",
-#         ["Multivariate Normal (Cholesky)", "Multivariate Student-t (Fat Tails)", "Historical Block Bootstrap"]
-#     )
-#     df_student = st.slider("Grados de Libertad (t-Student)", 3, 30, 5)
-#     horizon_years = st.slider("Horizonte Temporal de Proyección (Años)", 1.0, 15.0, 5.0, step=0.5)
-#     n_sims = st.selectbox("Número de Simulaciones", [1000, 5000, 10000, 25000], index=1)
-#     ruin_thresh = st.slider("Umbral de Ruina (% drawdown máx)", 10, 90, 30) / 100
-#     rf_rate = st.slider("Tasa Libre de Riesgo (%)", 0.0, 15.0, 4.0) / 100
-# 
-#     st.header("4. Análisis con IA (Opcional)")
-#     api_key_input = st.text_input("Ingresa API Key de OpenAI / Gemini", type="password")
-# 
-# # Procesar Tickers y pesos
-# tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-# try:
-#     raw_weights = np.array([float(w.strip()) for w in weights_input.split(",") if w.strip()])
-# except:
-#     st.error("Pesos con formato inválido.")
-#     st.stop()
-# 
-# if len(tickers) != len(raw_weights):
-#     st.error("El número de tickers y de pesos debe coincidir.")
-#     st.stop()
-# 
-# with st.spinner("Descargando datos, adaptando divisas y calibrando motor estocástico... "):
-#     prices, currency_map = fetch_market_data(tickers, years_history=years_hist, base_currency=base_currency)
-#     valid_tickers = list(prices.columns)
-#     weights = raw_weights / np.sum(raw_weights)
-# 
-#     # Ejecutar simulación
-#     sim = PortfolioMonteCarloSimulator(
-#         prices=prices,
-#         weights=weights,
-#         initial_capital=initial_capital,
-#         horizon_years=horizon_years,
-#         n_sims=n_sims,
-#         model_type=model_type,
-#         df_student=df_student,
-#         dca_active=dca_active,
-#         dca_amount=dca_amount,
-#         dca_freq=dca_freq,
-#         inflation_growth=inflation_growth
-#     )
-#     paths, invested_path = sim.run()
-# 
-#     # Motor de Métricas
-#     engine = InstitutionalMetricsEngine(
-#         paths=paths,
-#         invested_path=invested_path,
-#         risk_free_rate=rf_rate,
-#         ruin_threshold=ruin_thresh
-#     )
-#     metrics_results = engine.compute_all()
-#     kpis = metrics_results["kpis"]
-#     raw_metrics = metrics_results["metrics_raw"]
-# 
-# # ==============================================================================
-# # TARJETAS DE KPIs MÁSTER
-# # ==============================================================================
-# col1, col2, col3, col4, col5 = st.columns(5)
-# col1.metric("Capital Mediano (P50)", f"{symbol}{kpis['median_terminal']:,.0f}", f"CAGR: {kpis['expected_cagr']:.2%}")
-# col2.metric("VaR 95% (Riesgo Cola)", f"{kpis['var_95_pct']:.2%}", f"{symbol}{kpis['var_95_val']:,.0f}", delta_color="inverse")
-# col3.metric("CVaR 95% (Déficit)", f"{kpis['cvar_95_pct']:.2%}", f"{symbol}{kpis['cvar_95_val']:,.0f}", delta_color="inverse")
-# col4.metric("Max DD Esperado", f"{kpis['expected_max_dd']:.2%}", f"Ruina: {kpis['prob_ruin']:.1%}", delta_color="inverse")
-# col5.metric("Sharpe Ratio Mediano", f"{kpis['median_sharpe']:.2f}", f"Prob. Éxito: {kpis['prob_profit']:.1%}")
-# 
-# st.divider()
-# 
-# # ==============================================================================
-# # TABS DE VISUALIZACIÓN Y REPORTES
-# # ==============================================================================
-# tab1, tab2, tab3, tab4, tab5 = st.tabs([
-#     "📊 Fan Chart & DCA",
-#     "📉 Drawdowns & Stress Tests",
-#     "🔗 Matriz & Contribución al Riesgo",
-#     "🧠 AI Risk & Portfolio Report",
-#     "💾 Descarga & Datos"
-# ])
-# 
-# with tab1:
-#     st.subheader("Evolución Estocástica de la Cartera vs Capital Aportado")
-#     col_chart, col_meta = st.columns([1.5, 1])
-# 
-#     with col_chart:
-#         steps = np.arange(paths.shape[1])
-#         p05 = np.percentile(paths, 5, axis=0)
-#         p25 = np.percentile(paths, 25, axis=0)
-#         p50 = np.percentile(paths, 50, axis=0)
-#         p75 = np.percentile(paths, 75, axis=0)
-#         p95 = np.percentile(paths, 95, axis=0)
-# 
-#         fig = go.Figure()
-# 
-#         # Bandas
-#         fig.add_trace(go.Scatter(x=steps, y=p95, mode="lines", line=dict(color="rgba(16, 185, 129, 0.4)", width=1), name="Percentil 95"))
-#         fig.add_trace(go.Scatter(x=steps, y=p05, mode="lines", line=dict(color="rgba(239, 68, 68, 0.4)", width=1), fill="tonexty", fillcolor="rgba(150, 150, 150, 0.08)", name="Percentil 5 (VaR)"))
-#         fig.add_trace(go.Scatter(x=steps, y=p75, mode="lines", line=dict(width=0), showlegend=False))
-#         fig.add_trace(go.Scatter(x=steps, y=p25, mode="lines", line=dict(width=0), fill="tonexty", fillcolor="rgba(59, 130, 246, 0.15)", name="Rango Intercuartil (P25-P75)"))
-#         fig.add_trace(go.Scatter(x=steps, y=p50, mode="lines", line=dict(color="#2563EB", width=3), name="Mediana (P50)"))
-# 
-#         # Línea de capital aportado (DCA)
-#         fig.add_trace(go.Scatter(x=steps, y=invested_path, mode="lines", line=dict(color="#F59E0B", width=2, dash="dash"), name="Capital Total Aportado (DCA)"))
-# 
-#         # 25 caminos aleatorios para densidad
-#         sample_idx = np.random.choice(paths.shape[0], min(25, paths.shape[0]), replace=False)
-#         for idx in sample_idx:
-#             fig.add_trace(go.Scatter(x=steps, y=paths[idx], mode="lines", line=dict(color="rgba(255, 255, 255, 0.05)", width=1), showlegend=False))
-# 
-#         fig.update_layout(
-#             template="plotly_dark",
-#             xaxis_title="Días de Negociación",
-#             yaxis_title=f"Valor de Cartera ({symbol})",
-#             height=500
-#         )
-#         st.plotly_chart(fig, use_container_width=True)
-# 
-#     with col_meta:
-#         st.subheader("Distribución de Retornos Terminales")
-#         terminal_vals = paths[:, -1]
-#         fig_hist = px.histogram(x=terminal_vals, nbins=50, color_discrete_sequence=["#3B82F6"], opacity=0.7)
-#         fig_hist.add_vline(x=invested_path[-1], line_dash="dash", line_color="#F59E0B", annotation_text="Aportado")
-#         fig_hist.add_vline(x=np.median(terminal_vals), line_dash="solid", line_color="#2563EB", annotation_text="Mediana")
-#         fig_hist.update_layout(template="plotly_dark", showlegend=False, height=450)
-#         st.plotly_chart(fig_hist, use_container_width=True)
-# 
-# with tab2:
-#     st.subheader("Análisis de Stress & Curvas de Drawdown")
-#     c_left, c_right = st.columns(2)
-# 
-#     with c_left:
-#         # Graficar Drawdowns del P50 y el peor caso P05
-#         running_max = np.maximum.accumulate(paths, axis=1)
-#         drawdowns = (paths - running_max) / (running_max + 1e-12)
-#         dd_p50 = np.percentile(drawdowns, 50, axis=0)
-#         dd_p05 = np.percentile(drawdowns, 5, axis=0)
-# 
-#         fig_dd = go.Figure()
-#         fig_dd.add_trace(go.Scatter(x=steps, y=dd_p50, mode="lines", name="Drawdown Mediano", line=dict(color="#3B82F6")))
-#         fig_dd.add_trace(go.Scatter(x=steps, y=dd_p05, mode="lines", name="Drawdown Crítico (P05)", fill="tonexty", fillcolor="rgba(239, 68, 68, 0.1)", line=dict(color="#EF4444")))
-#         fig_dd.update_layout(template="plotly_dark", yaxis_title="Drawdown (%)", height=400)
-#         st.plotly_chart(fig_dd, use_container_width=True)
-# 
-#     with c_right:
-#         # Métricas de riesgo avanzadas en tabla
-#         st.write("**Estadísticas de Drawdown e Inestabilidad:**")
-#         stats_list = [
-#             ("Máximo Drawdown Promedio", f"{np.mean(raw_metrics['max_dd_per_sim']):.2%}"),
-#             ("Ulcer Index (Índice de Volatilidad a la Baja)", f"{np.mean(raw_metrics['ulcer_indices']):.4f}"),
-#             ("Duración Promedio del Drawdown (Días)", f"{np.mean(raw_metrics['dd_durations']):.1f} días"),
-#             ("Asimetría de Retornos (Skewness)", f"{kpis['skew']:.4f}"),
-#             ("Curtosis (Fat Tails)", f"{kpis['kurt']:.4f}"),
-#             ("Error de Simulación Monte Carlo (MCSE)", f"{kpis['mcse']:.4%}")
-#         ]
-#         st.table(pd.DataFrame(stats_list, columns=["Indicador de Estrés", "Valor Estocástico"]))
-# 
-# with tab3:
-#     st.subheader("Estructura de Correlaciones y Concentración de Riesgo")
-#     col_corr, col_risk = st.columns(2)
-# 
-#     with col_corr:
-#         corr = prices.pct_change().corr()
-#         fig_corr = px.imshow(corr, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
-#         fig_corr.update_layout(template="plotly_dark", height=400)
-#         st.plotly_chart(fig_corr, use_container_width=True)
-# 
-#     with col_risk:
-#         # Contribución marginal del riesgo (Aproximación por volatilidad histórica ponderada)
-#         vols = prices.pct_change().std() * np.sqrt(252)
-#         raw_contrib = weights * vols
-#         risk_contrib = raw_contrib / np.sum(raw_contrib)
-# 
-#         risk_df = pd.DataFrame({
-#             "Activo": valid_tickers,
-#             "Peso en Capital": weights,
-#             "Contribución al Riesgo": risk_contrib
-#         })
-# 
-#         fig_risk = go.Figure(data=[
-#             go.Bar(name="Peso en Capital (%)", x=risk_df["Activo"], y=risk_df["Peso en Capital"] * 100, marker_color="#3B82F6"),
-#             go.Bar(name="Contribución al Riesgo (%)", x=risk_df["Activo"], y=risk_df["Contribución al Riesgo"] * 100, marker_color="#EF4444")
-#         ])
-#         fig_risk.update_layout(template="plotly_dark", barmode="group", height=400)
-#         st.plotly_chart(fig_risk, use_container_width=True)
-# 
-# with tab4:
-#     st.subheader("🧠 AI Quantitative Analyst Report (Diagnóstico Estratégico)")
-# 
-#     # Generación de reporte estático instantáneo de alta fidelidad
-#     report_buffer = io.StringIO()
-#     report_buffer.write("## INFORME DE RIESGOS CUANTITATIVOS INSTITUCIONALES\n\n")
-#     report_buffer.write(f"**Fecha de Análisis:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-#     report_buffer.write(f"**Divisa de Reporte:** {base_currency} | **Universo de Activos:** {', '.join(valid_tickers)}\n\n")
-#     report_buffer.write("### 1. Diagnóstico de Eficiencia Riesgo-Retorno\n")
-#     report_buffer.write(f"- **Mediana Sharpe Ratio:** {kpis['median_sharpe']:.2f}. ")
-#     if kpis['median_sharpe'] > 1.0:
-#         report_buffer.write("El portafolio muestra una excelente robustez ajustada al riesgo en la mediana de los caminos.\n")
-#     else:
-#         report_buffer.write("Se sugiere rebalancear activos para optimizar la relación rentabilidad/volatilidad.\n")
-#     report_buffer.write(f"- **CAGR Esperado (Media):** {kpis['expected_cagr']:.2%}\n\n")
-# 
-#     report_buffer.write("### 2. Análisis de Estrés, Colas y Suficiencia de Capital\n")
-#     report_buffer.write(f"- El **Value at Risk (VaR 95%)** terminal es de **{kpis['var_95_pct']:.2%}**, lo que representa un riesgo potencial en divisa de **{symbol}{kpis['var_95_val']:,.0f}** para el capital original.\n")
-#     report_buffer.write(f"- El **Expected Shortfall / CVaR 95%** asciende a **{kpis['cvar_95_pct']:.2%}**.\n")
-#     report_buffer.write(f"- El **Drawdown Máximo Promedio** es de **{np.mean(raw_metrics['max_dd_per_sim']):.2%}** con una probabilidad de ruina crítica estimada en **{kpis['prob_ruin']:.2%}**.\n\n")
-# 
-#     report_buffer.write("### 3. Mitigación del Riesgo de Secuencia mediante DCA\n")
-#     if dca_active:
-#         report_buffer.write(f"- El plan DCA activo aporta un capital acumulado sustancial llegando a un total de **{symbol}{invested_path[-1]:,.0f}**. El suavizado estocástico del DCA optimiza drásticamente la resiliencia temporal frente al riesgo de sincronización (market-timing).\n")
-#     else:
-#         report_buffer.write("- Estrategia estática (Lump Sum). Implementar un esquema de DCA reduciría el impacto negativo de volatilidades tempranas.\n")
-# 
-#     report_text = report_buffer.getvalue()
-#     st.markdown(report_text)
-# 
-#     # Descarga del Reporte en formato Markdown
-#     st.download_button(
-#         label="📥 Descargar Reporte Completo (Markdown)",
-#         data=report_text,
-#         file_name="Informe_Riesgos_MonteCarlo.md",
-#         mime="text/markdown"
-#     )
-# 
-# with tab5:
-#     st.subheader("Resultados Numéricos de la Proyección de Caminos")
-#     raw_df = pd.DataFrame(paths[:, -1], columns=["Capital_Terminal"])
-#     st.dataframe(raw_df.head(100), use_container_width=True)
-# 
-#     csv = raw_df.to_csv(index=False).encode('utf-8')
-#     st.download_button(
-#         label="📥 Descargar Historial Completo de Escenarios (CSV)",
-#         data=csv,
-#         file_name="simulaciones_monte_carlo.csv",
-#         mime="text/csv"
-#     )
-#
+# ==============================================================================
+# 1. EXTRACCIÓN, CONVERSIÓN DE DIVISA Y LIMPIEZA DE DATOS REALES (YAHOO FINANCE)
+# ==============================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_market_data(tickers: list, years_history: int = 5, base_currency: str = "USD") -> tuple[pd.DataFrame, dict]:
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=int(years_history * 365.25))
+    raw = yf.download(tickers, start=start_date, end=end_date, auto_adjust=True, progress=False)
 
-# Commented out IPython magic to ensure Python compatibility.
-# %%writefile requirements.txt
-# streamlit
-# yfinance
-# numpy
-# pandas
-# scipy
-# plotly
+    if raw.empty:
+        return pd.DataFrame(), {}
 
-import time
-import re
-
-# Limpiar procesos anteriores si los hubiera
-!pkill -f streamlit || true
-!pkill -f cloudflared || true
-
-# Arrancar Streamlit
-!nohup streamlit run app.py --server.port 8501 > app.log 2>&1 &
-time.sleep(3)
-
-# Arrancar túnel de Cloudflare
-!nohup ./cloudflared-linux-amd64 tunnel --url http://localhost:8501 > tunnel.log 2>&1 &
-time.sleep(5)
-
-with open("tunnel.log", "r") as f:
-    logs = f.read()
-    match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", logs)
-    if match:
-        print("Tu aplicación ya está online en:", match.group(0))
+    if isinstance(raw.columns, pd.MultiIndex):
+        prices = raw["Close"]
     else:
-        print("Revisa los logs:\n", logs)
+        prices = raw[["Close"]] if "Close" in raw.columns else raw
+        prices.columns = tickers
 
-import time
-import re
+    prices = prices.dropna(axis=1, how="all").ffill().dropna()
+    valid_tickers = list(prices.columns)
+    converted_prices = prices.copy()
+    currency_map = {}
 
-# Limpiar procesos anteriores para evitar conflictos
-!pkill -f streamlit || true
-!pkill -f cloudflared || true
+    for ticker in valid_tickers:
+        try:
+            info = yf.Ticker(ticker).fast_info
+            currency = str(info.get("currency", "USD")).upper()
+        except Exception:
+            currency = "USD"
+        currency_map[ticker] = currency
 
-# Arrancar Streamlit con el app.py corregido y enriquecido
-!nohup streamlit run app.py --server.port 8501 > app.log 2>&1 &
-time.sleep(4)
+        if currency != base_currency:
+            pair = f"{currency}{base_currency}=X"
+            try:
+                fx_data = yf.download(pair, start=start_date, end=end_date, auto_adjust=True, progress=False)
+                if not fx_data.empty:
+                    fx_rates = fx_data["Close"] if isinstance(fx_data.columns, pd.MultiIndex) else fx_data[["Close"]]
+                    fx_rates = fx_rates.ffill().reindex(prices.index, method="ffill").bfill()
+                    converted_prices[ticker] = prices[ticker] * fx_rates.iloc[:, 0]
+            except Exception:
+                pass
 
-# Arrancar túnel de Cloudflare seguro
-!nohup ./cloudflared-linux-amd64 tunnel --url http://localhost:8501 > tunnel.log 2>&1 &
-# Espera extendida para garantizar la asignación estable del host de Cloudflare
-time.sleep(12)
+    return converted_prices, currency_map
 
-with open("tunnel.log", "r") as f:
-    logs = f.read()
-    match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", logs)
-    if match:
-        print("Tu aplicación de nivel Wall Street está online en:", match.group(0))
+
+# ==============================================================================
+# 2. MOTOR DE SIMULACIÓN MULTI-ACTIVO (CHOLESKY + COLAS PESADAS + BOOTSTRAP + DCA)
+# ==============================================================================
+class PortfolioMonteCarloSimulator:
+    def __init__(
+        self,
+        prices: pd.DataFrame,
+        weights: np.ndarray,
+        initial_capital: float = 100_000.0,
+        horizon_years: float = 1.0,
+        n_sims: int = 10_000,
+        model_type: str = "Multivariate Student-t (Fat Tails)",
+        df_student: int = 5,
+        dca_active: bool = False,
+        dca_amount: float = 1000.0,
+        dca_freq: str = "Monthly",
+        inflation_growth: float = 0.02,
+        seed: int = 42
+    ):
+        self.prices = prices
+        self.weights = weights / np.sum(weights)
+        self.initial_capital = initial_capital
+        self.horizon_years = horizon_years
+        self.horizon_days = max(1, int(horizon_years * 252))
+        self.n_sims = n_sims
+        self.model_type = model_type
+        self.df_student = df_student
+        self.dca_active = dca_active
+        self.dca_amount = dca_amount
+        self.dca_freq = dca_freq
+        self.inflation_growth = inflation_growth
+        self.rng = np.random.default_rng(seed)
+
+        self.log_returns = np.log(prices / prices.shift(1)).dropna()
+        self.simple_returns = prices.pct_change().dropna()
+        self.n_assets = len(self.weights)
+
+    def run(self) -> tuple[np.ndarray, np.ndarray]:
+        mu = self.log_returns.mean().values
+        cov = self.log_returns.cov().values
+
+        if self.model_type == "Historical Block Bootstrap":
+            hist_vals = self.simple_returns.values
+            n_hist = len(hist_vals)
+            idx = self.rng.integers(0, n_hist, size=(self.n_sims, self.horizon_days))
+            sampled_asset_returns = hist_vals[idx]
+            port_returns = np.tensordot(sampled_asset_returns, self.weights, axes=([2], [0]))
+        else:
+            L = np.linalg.cholesky(cov + np.eye(self.n_assets) * 1e-10)
+            Z = self.rng.standard_normal((self.n_sims, self.horizon_days, self.n_assets))
+
+            if self.model_type == "Multivariate Student-t (Fat Tails)":
+                chi2 = self.rng.chisquare(self.df_student, size=(self.n_sims, self.horizon_days, 1))
+                scale_factor = np.sqrt((self.df_student - 2) / chi2)
+                Z = Z * scale_factor
+
+            correlated_shocks = Z @ L.T
+            daily_log_ret = mu + correlated_shocks
+            asset_simple_ret = np.exp(daily_log_ret) - 1.0
+            port_returns = np.tensordot(asset_simple_ret, self.weights, axes=([2], [0]))
+
+        equity_curves = np.empty((self.n_sims, self.horizon_days + 1))
+        invested_capital = np.zeros(self.horizon_days + 1)
+
+        equity_curves[:, 0] = self.initial_capital
+        invested_capital[0] = self.initial_capital
+
+        step_interval = 21
+        if self.dca_freq == "Weekly":
+            step_interval = 5
+        elif self.dca_freq == "Quarterly":
+            step_interval = 63
+
+        current_dca = self.dca_amount
+        for t in range(1, self.horizon_days + 1):
+            equity_curves[:, t] = equity_curves[:, t - 1] * (1.0 + port_returns[:, t - 1])
+            invested_capital[t] = invested_capital[t - 1]
+
+            if self.dca_active and (t % step_interval == 0):
+                if t % 252 == 0:
+                    current_dca *= (1.0 + self.inflation_growth)
+                equity_curves[:, t] += current_dca
+                invested_capital[t] += current_dca
+
+        return equity_curves, invested_capital
+
+
+# ==============================================================================
+# 3. MOTOR DE MÉTRICAS CUANTITATIVAS INSTITUCIONALES
+# ==============================================================================
+class InstitutionalMetricsEngine:
+    def __init__(
+        self,
+        paths: np.ndarray,
+        invested_path: np.ndarray,
+        periods_per_year: int = 252,
+        risk_free_rate: float = 0.04,
+        ruin_threshold: float = 0.25
+    ):
+        self.paths = paths
+        self.invested_path = invested_path
+        self.n_sims, self.n_steps = paths.shape
+        self.periods_per_year = periods_per_year
+        self.rf_annual = risk_free_rate
+        self.rf_period = (1 + risk_free_rate) ** (1 / periods_per_year) - 1
+        self.ruin_threshold = ruin_threshold
+
+        # Retornos diarios puros de mercado (descontando flujos de DCA)
+        inflows = np.diff(invested_path)
+        self.market_returns = (paths[:, 1:] - inflows) / (paths[:, :-1] + 1e-12) - 1.0
+
+        self.initial_capital = paths[:, 0]
+        self.terminal_capital = paths[:, -1]
+        self.total_invested = invested_path[-1]
+        self.total_returns = (self.terminal_capital / (self.total_invested + 1e-12)) - 1.0
+
+    def _compute_drawdowns(self) -> np.ndarray:
+        running_max = np.maximum.accumulate(self.paths, axis=1)
+        return (self.paths - running_max) / (running_max + 1e-12)
+
+    def _compute_max_dd_duration(self, drawdowns: np.ndarray) -> np.ndarray:
+        is_underwater = drawdowns < 0
+        durations = np.zeros(self.n_sims, dtype=int)
+        for i in range(self.n_sims):
+            padded = np.concatenate(([False], is_underwater[i], [False]))
+            starts = np.where(padded[1:] & ~padded[:-1])[0]
+            ends = np.where(~padded[1:] & padded[:-1])[0]
+            if len(starts) > 0:
+                durations[i] = np.max(ends - starts)
+        return durations
+
+    def compute_all(self) -> dict:
+        n_years = self.market_returns.shape[1] / self.periods_per_year
+        # Crecimiento compuesto anualizado sobre retornos puros de mercado
+        cum_market_growth = np.prod(1.0 + self.market_returns, axis=1)
+        cagr_per_sim = np.maximum(cum_market_growth, 1e-9) ** (1 / n_years) - 1
+        ann_vol_per_sim = np.std(self.market_returns, axis=1, ddof=1) * np.sqrt(self.periods_per_year)
+
+        var_95_pct = np.percentile(self.total_returns, 5)
+        var_99_pct = np.percentile(self.total_returns, 1)
+        cvar_95_pct = np.mean(self.total_returns[self.total_returns <= var_95_pct])
+        cvar_99_pct = np.mean(self.total_returns[self.total_returns <= var_99_pct])
+
+        var_95_val = self.total_invested * var_95_pct
+        cvar_95_val = self.total_invested * cvar_95_pct
+
+        drawdowns = self._compute_drawdowns()
+        max_dd_per_sim = np.min(drawdowns, axis=1)
+        ulcer_indices = np.sqrt(np.mean(drawdowns ** 2, axis=1))
+        dd_durations = self._compute_max_dd_duration(drawdowns)
+
+        prob_profit = np.mean(self.terminal_capital > self.total_invested)
+        prob_beat_rf = np.mean(cagr_per_sim > self.rf_annual)
+        prob_ruin = np.mean(max_dd_per_sim <= -self.ruin_threshold)
+
+        excess_returns = self.market_returns - self.rf_period
+        sharpe_per_sim = (
+            np.mean(excess_returns, axis=1) / (np.std(self.market_returns, axis=1, ddof=1) + 1e-12)
+        ) * np.sqrt(self.periods_per_year)
+
+        downside_diff = np.minimum(0, self.market_returns)
+        downside_dev = np.sqrt(np.mean(downside_diff ** 2, axis=1)) * np.sqrt(self.periods_per_year)
+        sortino_per_sim = (cagr_per_sim - self.rf_annual) / (downside_dev + 1e-12)
+        calmar_per_sim = cagr_per_sim / (np.abs(max_dd_per_sim) + 1e-12)
+
+        skew = stats.skew(self.total_returns)
+        kurt = stats.kurtosis(self.total_returns)
+        mcse = np.std(self.total_returns, ddof=1) / np.sqrt(self.n_sims)
+
+        return {
+            "kpis": {
+                "median_terminal": np.median(self.terminal_capital),
+                "total_invested": self.total_invested,
+                "median_net_profit": np.median(self.terminal_capital) - self.total_invested,
+                "expected_cagr": np.mean(cagr_per_sim),
+                "var_95_pct": var_95_pct,
+                "var_95_val": var_95_val,
+                "cvar_95_pct": cvar_95_pct,
+                "cvar_95_val": cvar_95_val,
+                "var_99_pct": var_99_pct,
+                "cvar_99_pct": cvar_99_pct,
+                "expected_max_dd": np.mean(max_dd_per_sim),
+                "worst_dd_95": np.percentile(max_dd_per_sim, 5),
+                "prob_profit": prob_profit,
+                "prob_beat_rf": prob_beat_rf,
+                "prob_ruin": prob_ruin,
+                "median_sharpe": np.median(sharpe_per_sim),
+                "median_sortino": np.median(sortino_per_sim),
+                "median_calmar": np.median(calmar_per_sim),
+                "skew": skew,
+                "kurt": kurt,
+                "mcse": mcse
+            },
+            "metrics_raw": {
+                "cagr_per_sim": cagr_per_sim,
+                "ann_vol_per_sim": ann_vol_per_sim,
+                "max_dd_per_sim": max_dd_per_sim,
+                "ulcer_indices": ulcer_indices,
+                "dd_durations": dd_durations,
+                "sharpe_per_sim": sharpe_per_sim
+            }
+        }
+
+
+# ==============================================================================
+# 4. INTERFAZ DE USUARIO STREAMLIT
+# ==============================================================================
+st.title("📈 Institutional Portfolio Monte Carlo Engine")
+st.caption("Plataforma de análisis de riesgos cuantitativos con datos en tiempo real, conversión multi-divisa, simulación DCA y analítica institucional.")
+
+with st.sidebar:
+    st.header("1. Selección de Divisa & Cartera")
+    base_currency = st.selectbox("Divisa Base de Reporte", ["USD", "EUR", "GBP", "CHF", "JPY"])
+    currency_symbols = {"USD": "$", "EUR": "€", "GBP": "£", "CHF": "CHF ", "JPY": "¥"}
+    symbol = currency_symbols[base_currency]
+
+    tickers_input = st.text_input("Tickers (Yahoo Finance)", "SPY, QQQ, GLD, TLT, BTC-USD")
+    weights_input = st.text_input("Pesos (Separados por coma)", "0.35, 0.25, 0.15, 0.15, 0.10")
+    years_hist = st.slider("Años de Calibración Histórica", 1, 15, 5)
+
+    st.header("2. Estrategia DCA (Aportes Periódicos)")
+    dca_active = st.checkbox("Activar Aportaciones Periódicas (DCA)", value=True)
+    initial_capital = st.number_input("Capital Inicial", min_value=0, value=50000, step=5000)
+    dca_amount = st.number_input("Aporte Fijo de DCA", min_value=0, value=1000, step=100, disabled=not dca_active)
+    dca_freq = st.selectbox("Frecuencia DCA", ["Weekly", "Monthly", "Quarterly"], index=1, disabled=not dca_active)
+    inflation_growth = st.slider("Crecimiento DCA por Inflación (%)", 0.0, 10.0, 2.0, disabled=not dca_active) / 100
+
+    st.header("3. Configuración del Motor")
+    model_type = st.selectbox(
+        "Motor de Simulación",
+        ["Multivariate Normal (Cholesky)", "Multivariate Student-t (Fat Tails)", "Historical Block Bootstrap"],
+        index=1
+    )
+    df_student = st.slider("Grados de Libertad (t-Student)", 3, 30, 5, disabled=(model_type != "Multivariate Student-t (Fat Tails)"))
+    horizon_years = st.slider("Horizonte Temporal de Proyección (Años)", 1.0, 15.0, 5.0, step=0.5)
+    n_sims = st.selectbox("Número de Simulaciones", [1000, 5000, 10000, 25000], index=1)
+    ruin_thresh = st.slider("Umbral de Ruina (% drawdown máx)", 10, 90, 30) / 100
+    rf_rate = st.slider("Tasa Libre de Riesgo (%)", 0.0, 15.0, 4.0) / 100
+
+    st.header("4. Análisis con IA Generativa (Opcional)")
+    llm_provider = st.selectbox("Proveedor IA", ["Motor Experto Local (Gratis)", "OpenAI (GPT-4o-mini)", "Google Gemini"])
+    api_key_input = st.text_input("API Key (si eliges OpenAI / Gemini)", type="password")
+
+tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+try:
+    raw_weights = np.array([float(w.strip()) for w in weights_input.split(",") if w.strip()])
+except ValueError:
+    st.error("Pesos con formato inválido. Usa números separados por coma.")
+    st.stop()
+
+if len(tickers) != len(raw_weights) or len(tickers) == 0:
+    st.error("El número de tickers y de pesos debe coincidir y no puede estar vacío.")
+    st.stop()
+
+with st.spinner("Descargando datos, adaptando divisas y calibrando motor estocástico..."):
+    prices, currency_map = fetch_market_data(tickers, years_history=years_hist, base_currency=base_currency)
+    if prices.empty:
+        st.error("No se pudieron descargar datos para los tickers introducidos. Verifica los símbolos en Yahoo Finance.")
+        st.stop()
+
+    valid_tickers = list(prices.columns)
+    if len(valid_tickers) < len(tickers):
+        missing = set(tickers) - set(valid_tickers)
+        st.warning(f"Tickers omitidos sin datos: {', '.join(missing)}")
+        mask = [t in valid_tickers for t in tickers]
+        raw_weights = raw_weights[mask]
+
+    weights = raw_weights / np.sum(raw_weights)
+
+    sim = PortfolioMonteCarloSimulator(
+        prices=prices,
+        weights=weights,
+        initial_capital=initial_capital,
+        horizon_years=horizon_years,
+        n_sims=n_sims,
+        model_type=model_type,
+        df_student=df_student,
+        dca_active=dca_active,
+        dca_amount=dca_amount,
+        dca_freq=dca_freq,
+        inflation_growth=inflation_growth
+    )
+    paths, invested_path = sim.run()
+
+    engine = InstitutionalMetricsEngine(
+        paths=paths,
+        invested_path=invested_path,
+        risk_free_rate=rf_rate,
+        ruin_threshold=ruin_thresh
+    )
+    metrics_results = engine.compute_all()
+    kpis = metrics_results["kpis"]
+    raw_metrics = metrics_results["metrics_raw"]
+
+# ==============================================================================
+# TARJETAS DE KPIs MÁSTER
+# ==============================================================================
+col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric(
+    "Capital Mediano (P50)",
+    f"{symbol}{kpis['median_terminal']:,.0f}",
+    f"Benef. Neto: {symbol}{kpis['median_net_profit']:,.0f}"
+)
+col2.metric(
+    "VaR 95% (Sobre Invertido)",
+    f"{kpis['var_95_pct']:.2%}",
+    f"{symbol}{kpis['var_95_val']:,.0f}",
+    delta_color="inverse"
+)
+col3.metric(
+    "CVaR 95% (Expected Shortfall)",
+    f"{kpis['cvar_95_pct']:.2%}",
+    f"{symbol}{kpis['cvar_95_val']:,.0f}",
+    delta_color="inverse"
+)
+col4.metric(
+    "Max Drawdown Esperado",
+    f"{kpis['expected_max_dd']:.2%}",
+    f"Prob. Ruina: {kpis['prob_ruin']:.1%}",
+    delta_color="inverse"
+)
+col5.metric(
+    "Sharpe / Sortino Mediano",
+    f"{kpis['median_sharpe']:.2f} / {kpis['median_sortino']:.2f}",
+    f"CAGR Mercado: {kpis['expected_cagr']:.2%}"
+)
+
+st.divider()
+
+# ==============================================================================
+# TABS DE VISUALIZACIÓN Y REPORTES
+# ==============================================================================
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📊 Fan Chart & DCA",
+    "📉 Drawdowns & Stress Tests",
+    "🔗 Matriz & Contribución al Riesgo",
+    "🧠 AI Risk & Portfolio Report",
+    "💾 Descarga & Datos"
+])
+
+with tab1:
+    st.subheader(f"Evolución Estocástica de la Cartera vs Capital Aportado ({symbol}{kpis['total_invested']:,.0f})")
+    col_chart, col_meta = st.columns([1.5, 1])
+
+    with col_chart:
+        steps = np.arange(paths.shape[1])
+        p05 = np.percentile(paths, 5, axis=0)
+        p25 = np.percentile(paths, 25, axis=0)
+        p50 = np.percentile(paths, 50, axis=0)
+        p75 = np.percentile(paths, 75, axis=0)
+        p95 = np.percentile(paths, 95, axis=0)
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=steps, y=p95, mode="lines", line=dict(color="rgba(16, 185, 129, 0.6)", width=1.5), name="Percentil 95 (Optimista)"))
+        fig.add_trace(go.Scatter(x=steps, y=p05, mode="lines", line=dict(color="rgba(239, 68, 68, 0.6)", width=1.5), fill="tonexty", fillcolor="rgba(150, 150, 150, 0.08)", name="Percentil 5 (VaR)"))
+        fig.add_trace(go.Scatter(x=steps, y=p75, mode="lines", line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(x=steps, y=p25, mode="lines", line=dict(width=0), fill="tonexty", fillcolor="rgba(59, 130, 246, 0.18)", name="Rango Intercuartil (P25-P75)"))
+        fig.add_trace(go.Scatter(x=steps, y=p50, mode="lines", line=dict(color="#2563EB", width=3), name="Mediana (P50)"))
+        fig.add_trace(go.Scatter(x=steps, y=invested_path, mode="lines", line=dict(color="#F59E0B", width=2.5, dash="dash"), name="Capital Total Aportado (DCA)"))
+
+        sample_idx = np.random.choice(paths.shape[0], min(25, paths.shape[0]), replace=False)
+        for idx in sample_idx:
+            fig.add_trace(go.Scatter(x=steps, y=paths[idx], mode="lines", line=dict(color="rgba(255, 255, 255, 0.06)", width=1), showlegend=False, hoverinfo="skip"))
+
+        fig.update_layout(
+            template="plotly_dark",
+            xaxis_title="Días Bursátiles",
+            yaxis_title=f"Valor de Cartera ({symbol})",
+            hovermode="x unified",
+            height=500,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_meta:
+        st.subheader("Distribución de Capital Terminal")
+        terminal_vals = paths[:, -1]
+        var_95_abs = np.percentile(terminal_vals, 5)
+        fig_hist = px.histogram(x=terminal_vals, nbins=55, color_discrete_sequence=["#3B82F6"], opacity=0.75)
+        fig_hist.add_vline(x=invested_path[-1], line_dash="dash", line_color="#F59E0B", annotation_text="Aportado")
+        fig_hist.add_vline(x=np.median(terminal_vals), line_dash="solid", line_color="#10B981", annotation_text="Mediana")
+        fig_hist.add_vline(x=var_95_abs, line_dash="dot", line_color="#EF4444", annotation_text="P05")
+        fig_hist.update_layout(template="plotly_dark", showlegend=False, height=500, xaxis_title=f"Capital Final ({symbol})", yaxis_title="Frecuencia")
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+with tab2:
+    st.subheader("Análisis de Estrés & Curvas Underwater (Drawdowns)")
+    c_left, c_right = st.columns([1.3, 1])
+
+    with c_left:
+        steps = np.arange(paths.shape[1])
+        running_max = np.maximum.accumulate(paths, axis=1)
+        drawdowns = (paths - running_max) / (running_max + 1e-12)
+        dd_p50 = np.percentile(drawdowns, 50, axis=0) * 100
+        dd_p05 = np.percentile(drawdowns, 5, axis=0) * 100
+
+        fig_dd = go.Figure()
+        fig_dd.add_trace(go.Scatter(x=steps, y=dd_p50, mode="lines", name="Drawdown Mediano (%)", line=dict(color="#3B82F6")))
+        fig_dd.add_trace(go.Scatter(x=steps, y=dd_p05, mode="lines", name="Drawdown Crítico P05 (%)", fill="tonexty", fillcolor="rgba(239, 68, 68, 0.15)", line=dict(color="#EF4444")))
+        fig_dd.update_layout(template="plotly_dark", xaxis_title="Días Bursátiles", yaxis_title="Caída desde Máximo (%)", height=430)
+        st.plotly_chart(fig_dd, use_container_width=True)
+
+    with c_right:
+        st.write("**Métricas Institucionales de Estrés y Eficiencia:**")
+        stats_list = [
+            ("Capital Total Aportado", f"{symbol}{kpis['total_invested']:,.2f}"),
+            ("Beneficio Neto Mediano", f"{symbol}{kpis['median_net_profit']:,.2f}"),
+            ("Probabilidad de Beneficio (> Aportado)", f"{kpis['prob_profit']:.2%}"),
+            ("Probabilidad Superar Risk-Free", f"{kpis['prob_beat_rf']:.2%}"),
+            ("VaR 99% / CVaR 99%", f"{kpis['var_99_pct']:.2%} / {kpis['cvar_99_pct']:.2%}"),
+            ("Máximo Drawdown Promedio", f"{kpis['expected_max_dd']:.2%}"),
+            ("Máximo Drawdown Cola 95% (P05)", f"{kpis['worst_dd_95']:.2%}"),
+            ("Calmar Ratio Mediano", f"{kpis['median_calmar']:.4f}"),
+            ("Ulcer Index Medio", f"{np.mean(raw_metrics['ulcer_indices']):.4f}"),
+            ("Duración Promedio Max Drawdown", f"{np.mean(raw_metrics['dd_durations']):.1f} días"),
+            ("Asimetría / Curtosis Excedente", f"{kpis['skew']:.2f} / {kpis['kurt']:.2f}"),
+            ("Error Estándar Monte Carlo (MCSE)", f"{kpis['mcse']:.4%}")
+        ]
+        st.dataframe(pd.DataFrame(stats_list, columns=["Indicador Cuantitativo", "Valor"]), use_container_width=True, hide_index=True, height=430)
+
+with tab3:
+    st.subheader("Estructura de Correlaciones y Contribución al Riesgo por Activo")
+    col_corr, col_risk = st.columns(2)
+
+    with col_corr:
+        corr = prices.pct_change().corr()
+        fig_corr = px.imshow(corr, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
+        fig_corr.update_layout(template="plotly_dark", height=420, title="Matriz de Correlación Histórica")
+        st.plotly_chart(fig_corr, use_container_width=True)
+
+    with col_risk:
+        vols = prices.pct_change().std() * np.sqrt(252)
+        raw_contrib = weights * vols.values
+        risk_contrib = raw_contrib / np.sum(raw_contrib)
+
+        risk_df = pd.DataFrame({
+            "Activo": [f"{t} ({currency_map.get(t, 'USD')})" for t in valid_tickers],
+            "Peso en Capital": weights,
+            "Contribución al Riesgo": risk_contrib
+        })
+
+        fig_risk = go.Figure(data=[
+            go.Bar(name="Peso en Capital (%)", x=risk_df["Activo"], y=risk_df["Peso en Capital"] * 100, marker_color="#3B82F6"),
+            go.Bar(name="Contribución al Riesgo (%)", x=risk_df["Activo"], y=risk_df["Contribución al Riesgo"] * 100, marker_color="#EF4444")
+        ])
+        fig_risk.update_layout(template="plotly_dark", barmode="group", height=420, title="Peso en Capital vs. Riesgo Aportado")
+        st.plotly_chart(fig_risk, use_container_width=True)
+
+with tab4:
+    st.subheader("🧠 AI Quantitative Analyst Report (Diagnóstico Estratégico)")
+
+    vols = prices.pct_change().std() * np.sqrt(252)
+    risk_contrib = (weights * vols.values) / np.sum(weights * vols.values)
+    top_risk_idx = int(np.argmax(risk_contrib))
+    top_risk_ticker = valid_tickers[top_risk_idx]
+
+    report_buffer = io.StringIO()
+    report_buffer.write("## INFORME DE RIESGOS CUANTITATIVOS INSTITUCIONALES\n\n")
+    report_buffer.write(f"**Fecha:** {datetime.now().strftime('%Y-%m-%d %H:%M')} | **Divisa:** {base_currency} | **Motor:** {model_type}\n")
+    report_buffer.write(f"**Cartera:** {', '.join([f'{t} ({w:.0%})' for t, w in zip(valid_tickers, weights)])}\n\n")
+
+    report_buffer.write("### 1. Diagnóstico de Eficiencia Riesgo-Retorno\n")
+    report_buffer.write(f"- **Sharpe Ratio Mediano:** `{kpis['median_sharpe']:.2f}` | **Sortino Ratio Mediano:** `{kpis['median_sortino']:.2f}` | **Calmar Ratio:** `{kpis['median_calmar']:.2f}`.\n")
+    if kpis["median_sharpe"] >= 1.0:
+        report_buffer.write("- **Evaluación:** La cartera presenta una eficiencia institucional sólida, generando prima de rentabilidad superior a la volatilidad asumida.\n")
     else:
-        print("Error al inicializar el túnel de Cloudflared. Revisa los logs:\n", logs)
+        report_buffer.write("- **Evaluación:** Eficiencia moderada. Conviene revisar la diversificación entre activos descorrelacionados para elevar el Sharpe por encima de 1.0.\n")
+    report_buffer.write(f"- **CAGR Puro de Mercado Esperado:** `{kpis['expected_cagr']:.2%}`.\n\n")
+
+    report_buffer.write("### 2. Análisis de Estrés, Colas y Suficiencia de Capital\n")
+    report_buffer.write(f"- **VaR 95% Terminal:** `{kpis['var_95_pct']:.2%}` (`{symbol}{kpis['var_95_val']:,.0f}` respecto al capital total aportado).\n")
+    report_buffer.write(f"- **CVaR / Expected Shortfall 95%:** `{kpis['cvar_95_pct']:.2%}` (`{symbol}{kpis['cvar_95_val']:,.0f}` en el promedio del peor 5% de escenarios).\n")
+    report_buffer.write(f"- **Drawdown Máximo Esperado:** `{kpis['expected_max_dd']:.2%}` (Peor cola 95%: `{kpis['worst_dd_95']:.2%}`), con una probabilidad de tocar el umbral de ruina (`-{ruin_thresh:.0%}`) del **{kpis['prob_ruin']:.2%}**.\n\n")
+
+    report_buffer.write("### 3. Concentración de Riesgo & Impacto del DCA\n")
+    report_buffer.write(f"- **Principal motor de volatilidad:** `{top_risk_ticker}` representa el **{weights[top_risk_idx]:.1%}** del capital, pero concentra el **{risk_contrib[top_risk_idx]:.1%}** del riesgo total de la cartera.\n")
+    if dca_active:
+        report_buffer.write(f"- **Efecto DCA:** Aportando `{symbol}{dca_amount:,.0f}` ({dca_freq}), el capital total invertido alcanza `{symbol}{kpis['total_invested']:,.0f}` y el capital mediano proyectado llega a `{symbol}{kpis['median_terminal']:,.0f}` (probabilidad de beneficio del **{kpis['prob_profit']:.1%}**).\n")
+    else:
+        report_buffer.write("- **Efecto Lump Sum:** Sin aportaciones periódicas, la cartera queda expuesta al riesgo de secuencia de retornos en los primeros meses.\n")
+
+    report_text = report_buffer.getvalue()
+
+    if llm_provider != "Motor Experto Local (Gratis)" and api_key_input:
+        if st.button("✨ Generar Memorando Ejecutivo con IA Generativa"):
+            with st.spinner("Redigiendo análisis cuantitativo con IA..."):
+                prompt_llm = (
+                    "Eres un Managing Director de Gestión de Riesgos en Wall Street. Analiza estas métricas de simulación Monte Carlo "
+                    "y redacta un memorando ejecutivo profesional en español con diagnóstico, riesgos ocultos y 3 recomendaciones concretas:\n\n"
+                    + report_text
+                )
+                try:
+                    if llm_provider == "OpenAI (GPT-4o-mini)":
+                        req = urllib.request.Request(
+                            "https://api.openai.com/v1/chat/completions",
+                            data=json.dumps({
+                                "model": "gpt-4o-mini",
+                                "messages": [{"role": "user", "content": prompt_llm}],
+                                "temperature": 0.3
+                            }).encode("utf-8"),
+                            headers={
+                                "Content-Type": "application/json",
+                                "Authorization": f"Bearer {api_key_input}"
+                            }
+                        )
+                        with urllib.request.urlopen(req, timeout=30) as resp:
+                            res_json = json.loads(resp.read().decode("utf-8"))
+                            report_text = res_json["choices"][0]["message"]["content"]
+                    elif llm_provider == "Google Gemini":
+                        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key_input}"
+                        req = urllib.request.Request(
+                            url,
+                            data=json.dumps({"contents": [{"parts": [{"text": prompt_llm}]}]}).encode("utf-8"),
+                            headers={"Content-Type": "application/json"}
+                        )
+                        with urllib.request.urlopen(req, timeout=30) as resp:
+                            res_json = json.loads(resp.read().decode("utf-8"))
+                            report_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+                except Exception as e:
+                    st.error(f"No se pudo conectar con la API externa ({e}). Mostrando informe del Motor Experto Local.")
+
+    st.markdown(report_text)
+
+    st.download_button(
+        label="📥 Descargar Reporte Completo (Markdown)",
+        data=report_text,
+        file_name="Informe_Riesgos_MonteCarlo.md",
+        mime="text/markdown"
+    )
+
+with tab5:
+    st.subheader("Resultados Numéricos de la Proyección de Caminos")
+    raw_df = pd.DataFrame({
+        "Simulacion": np.arange(1, len(paths) + 1),
+        f"Capital_Terminal_{base_currency}": paths[:, -1],
+        "Retorno_Sobre_Invertido_Pct": ((paths[:, -1] / invested_path[-1]) - 1.0) * 100
+    })
+    st.dataframe(raw_df.head(100), use_container_width=True, hide_index=True)
+
+    csv = raw_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="📥 Descargar Todos los Escenarios Simulados (CSV)",
+        data=csv,
+        file_name="simulaciones_monte_carlo.csv",
+        mime="text/csv"
+    )
